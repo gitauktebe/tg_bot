@@ -16,14 +16,12 @@ from config import (
     TEXT_BACK_BTN, TEXT_MENU_TITLE
 )
 
-# --- НАСТРОЙКА ЛОГОВ ---
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# --- КЛАВИАТУРЫ ---
 menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📷 Отправить материал")],
@@ -36,24 +34,20 @@ back_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# --- СОСТОЯНИЯ И СВЯЗКИ ---
-user_mode = defaultdict(lambda: None)              # user_id -> режим ("material"/"question")
-albums = {}                                        # (user_id, media_group_id) -> список файлов
-topic_link = {}                                    # message_id в топике -> user_id
+user_mode = defaultdict(lambda: None)
+albums = {}
+topic_link = {}
 ID_RE = re.compile(r"\(id=(\d+)\)")
 
-# --- ВСПОМОГАТЕЛЬНОЕ ---
 def user_tag(m: Message) -> str:
     uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
     return f"{uname} (id={m.from_user.id})"
 
-# --- СТАРТ ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_mode[message.from_user.id] = None
     await message.answer("👋 Привет! Выбери, что хочешь сделать:", reply_markup=menu_kb)
 
-# --- КНОПКИ ---
 @dp.message(F.text == "📷 Отправить материал")
 async def choose_material(message: Message):
     user_mode[message.from_user.id] = "material"
@@ -69,7 +63,7 @@ async def back_to_menu(message: Message):
     user_mode[message.from_user.id] = None
     await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
 
-# --- ОБРАБОТКА СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ ---
+# ======== ОБРАБОТКА СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЕЙ ========
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: Message):
     mode = user_mode.get(message.from_user.id)
@@ -90,26 +84,24 @@ async def handle_user_message(message: Message):
 
     # ---- МАТЕРИАЛ ----
     if mode == "material":
-        # --- если альбом ---
+        key = (uid, message.media_group_id or message.message_id)
+
         if message.media_group_id and (message.photo or message.video):
-            key = (uid, message.media_group_id)
             bucket = albums.setdefault(key, [])
             if message.photo:
                 bucket.append(InputMediaPhoto(media=message.photo[-1].file_id))
             elif message.video:
                 bucket.append(InputMediaVideo(media=message.video.file_id))
 
-            # ждём завершения альбома
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2)  # ждём, пока придут все части альбома
+
             if key in albums and bucket is albums[key]:
-                # отправляем весь материал СНАЧАЛА
                 sent_media = await bot.send_media_group(
                     chat_id=ADMIN_CHAT_ID,
                     message_thread_id=TOPIC_MATERIAL,
                     media=bucket
                 )
 
-                # после отправки добавляем подпись
                 caption_msg = await bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     message_thread_id=TOPIC_MATERIAL,
@@ -117,15 +109,13 @@ async def handle_user_message(message: Message):
                 )
                 topic_link[caption_msg.message_id] = uid
 
-                # подтверждаем пользователю
                 await message.answer("✅ Материал доставлен!", reply_markup=menu_kb)
                 user_mode[uid] = None
                 albums.pop(key, None)
             return
 
-        # --- одиночное медиа ---
+        # одиночное медиа
         if message.photo or message.video or message.document:
-            # сначала отправляем файл
             if message.photo:
                 await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, message_thread_id=TOPIC_MATERIAL)
             elif message.video:
@@ -133,7 +123,6 @@ async def handle_user_message(message: Message):
             elif message.document:
                 await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, message_thread_id=TOPIC_MATERIAL)
 
-            # затем подпись
             sent = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 message_thread_id=TOPIC_MATERIAL,
@@ -145,24 +134,18 @@ async def handle_user_message(message: Message):
             user_mode[uid] = None
             return
 
-        # --- если текст без вложений ---
         await message.answer("📸 Прикрепи фото или видео материал, можешь добавить описание.", reply_markup=back_kb)
         return
 
-    # если вне режима
     await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
 
-# --- ОТВЕТ АДМИНА ---
+# ======== ОТВЕТ АДМИНА ========
 @dp.message(F.chat.id == ADMIN_CHAT_ID)
 async def handle_admin_reply(message: Message):
-    """Любой reply из топика пересылает пользователю ответ."""
     if not message.reply_to_message:
         return
 
-    # пробуем найти user_id из topic_link
     user_id = topic_link.get(message.reply_to_message.message_id)
-
-    # если не нашли — парсим (id=12345)
     if not user_id:
         src = message.reply_to_message.text or message.reply_to_message.caption or ""
         match = ID_RE.search(src)
@@ -175,20 +158,18 @@ async def handle_admin_reply(message: Message):
     if not user_id:
         return
 
-    # отправляем ответ
     try:
         if message.text:
-            await bot.send_message(user_id, f"💬 Ответ администратора:\n\n{message.text}")
+            await bot.send_message(user_id, f"💬 Ответ от учителя:\n\n{message.text}")
         elif message.photo:
-            await bot.send_photo(user_id, message.photo[-1].file_id, caption="💬 Ответ администратора")
+            await bot.send_photo(user_id, message.photo[-1].file_id, caption="💬 Ответ от учителя")
         elif message.video:
-            await bot.send_video(user_id, message.video.file_id, caption="💬 Ответ администратора")
+            await bot.send_video(user_id, message.video.file_id, caption="💬 Ответ от учителя")
         elif message.document:
-            await bot.send_document(user_id, message.document.file_id, caption="💬 Ответ администратора")
+            await bot.send_document(user_id, message.document.file_id, caption="💬 Ответ от учителя")
     except Exception as e:
         log.error(f"Ошибка при пересылке ответа: {e}")
 
-# --- ЗАПУСК ---
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("[BOT] Запуск…")
