@@ -1,251 +1,225 @@
-"""Telegram bot entry point."""
-from __future__ import annotations
-
 import asyncio
 import logging
-import sys
-from pathlib import Path
-from typing import Dict
+import re
+from collections import defaultdict
+from typing import List
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
-from logging.handlers import RotatingFileHandler
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, KeyboardButton, ReplyKeyboardMarkup,
+    InputMediaPhoto, InputMediaVideo
+)
 
-import config
+from config import (
+    TOKEN, ADMIN_CHAT_ID, TOPIC_MATERIAL, TOPIC_QUESTION,
+    TEXT_WELCOME, TEXT_MATERIAL_INSTR, TEXT_QUESTION_INSTR,
+    TEXT_BACK_BTN, TEXT_MENU_TITLE, TEXT_THANKS_MATERIAL, TEXT_THANKS_QUESTION,
+    ALBUM_CHUNK
+)
 
-router = Router()
-message_links: Dict[int, int] = {}
+# ---------- ЛОГИ ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("bot")
 
+# ---------- BOT / DP ----------
+bot = Bot(TOKEN)
+dp = Dispatcher()
 
-def setup_logging() -> None:
-    """Configure logging to console and file."""
-    log_file = Path(config.LOG_FILE)
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"),
-    ]
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        handlers=handlers,
-    )
-
-
-setup_logging()
-logger = logging.getLogger(__name__)
-
-main_menu = ReplyKeyboardMarkup(
+# ---------- КЛАВИАТУРЫ ----------
+menu_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=config.BUTTONS.send_material)],
-        [KeyboardButton(text=config.BUTTONS.ask_question)],
+        [KeyboardButton(text="📷 Отправить материал")],
+        [KeyboardButton(text="❓ Задать вопрос")]
     ],
-    resize_keyboard=True,
+    resize_keyboard=True
+)
+back_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=TEXT_BACK_BTN)]],
+    resize_keyboard=True
 )
 
-back_menu = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=config.TEXTS.back_button)]],
-    resize_keyboard=True,
-)
+# ---------- ПРОСТЕЙШЕЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ ----------
+# user_mode[user_id] = "material" | "question" | None
+user_mode: dict[int, str | None] = defaultdict(lambda: None)
 
+# Копим элементы альбомов по ключу (user_id, media_group_id)
+albums: dict[tuple[int, str], List[InputMediaPhoto | InputMediaVideo]] = {}
 
-def _format_user(message: Message) -> str:
-    user = message.from_user
-    if user is None:
-        return "Неизвестный пользователь"
+# Привязка msg_id в теме -> user_id, чтобы админ мог ответить реплаем
+topic_link: dict[int, int] = {}
 
-    username = f"@{user.username}" if user.username else "без username"
-    return f"{user.full_name} ({username}) (id={user.id})"
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+ID_RE = re.compile(r"\(id=(\d+)\)")
 
+def user_tag(m: Message) -> str:
+    uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+    return f"{uname} (id={m.from_user.id})"
 
-async def _notify_delivery_error(message: Message) -> None:
-    try:
-        await message.answer(config.TEXTS.delivery_error)
-    except TelegramAPIError:
-        logger.exception("Failed to notify user about delivery error")
+async def send_album_in_chunks(chat_id: int, thread_id: int, media_list: List[InputMediaPhoto | InputMediaVideo]):
+    """Отправляем альбом пачками по 10, если медиа больше лимита."""
+    if not media_list:
+        return []
+    chunks = [media_list[i:i+ALBUM_CHUNK] for i in range(0, len(media_list), ALBUM_CHUNK)]
+    sent_msgs = []
+    for chunk in chunks:
+        sent = await bot.send_media_group(chat_id=chat_id, message_thread_id=thread_id, media=chunk)
+        sent_msgs.extend(sent)
+        await asyncio.sleep(0.2)  # лёгкая пауза, чтобы не задирать CPU и не ловить flood
+    return sent_msgs
 
+# ---------- ХЭНДЛЕРЫ ----------
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_mode[message.from_user.id] = None
+    await message.answer(TEXT_WELCOME, reply_markup=menu_kb)
 
-@router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    await message.answer(config.TEXTS.greeting, reply_markup=main_menu)
+@dp.message(F.text == "📷 Отправить материал")
+async def choose_material(message: Message):
+    user_mode[message.from_user.id] = "material"
+    await message.answer(TEXT_MATERIAL_INSTR, reply_markup=back_kb)
 
+@dp.message(F.text == "❓ Задать вопрос")
+async def choose_question(message: Message):
+    user_mode[message.from_user.id] = "question"
+    await message.answer(TEXT_QUESTION_INSTR, reply_markup=back_kb)
 
-@router.message(F.text == config.BUTTONS.send_material)
-async def send_material_info(message: Message) -> None:
-    await message.answer(config.TEXTS.material_instruction, reply_markup=back_menu)
+@dp.message(F.text == TEXT_BACK_BTN)
+async def back_to_menu(message: Message):
+    user_mode[message.from_user.id] = None
+    await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
 
+# --- Основной обработчик лички пользователя ---
+@dp.message(F.chat.type == "private")
+async def handle_user_private(message: Message):
+    mode = user_mode.get(message.from_user.id)
 
-@router.message(F.text == config.BUTTONS.ask_question)
-async def send_question_info(message: Message) -> None:
-    await message.answer(config.TEXTS.question_instruction, reply_markup=back_menu)
+    # 1) Режим ВОПРОС
+    if mode == "question":
+        if message.text:
+            header = f"❓ Вопрос от {user_tag(message)}:\n\n{message.text}"
+        else:
+            header = f"❓ Вопрос от {user_tag(message)}"
+        sent = await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            message_thread_id=TOPIC_QUESTION,
+            text=header
+        )
+        topic_link[sent.message_id] = message.from_user.id
+        await message.answer(TEXT_THANKS_QUESTION, reply_markup=menu_kb)
+        user_mode[message.from_user.id] = None
+        return
 
+    # 2) Режим МАТЕРИАЛ
+    if mode == "material":
+        # --- альбомы ---
+        if message.media_group_id and (message.photo or message.video):
+            key = (message.from_user.id, message.media_group_id)
+            bucket = albums.setdefault(key, [])
+            if message.photo:
+                bucket.append(InputMediaPhoto(media=message.photo[-1].file_id))
+            elif message.video:
+                bucket.append(InputMediaVideo(media=message.video.file_id))
 
-@router.message(F.text == config.TEXTS.back_button)
-async def go_back(message: Message) -> None:
-    await message.answer(config.TEXTS.main_menu, reply_markup=main_menu)
+            # «дебаунс» — ждём ещё немного элементов этого же альбома
+            await asyncio.sleep(1.2)
+            if key in albums and bucket is albums[key]:
+                # отправляем заголовок один раз
+                caption_msg = await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_thread_id=TOPIC_MATERIAL,
+                    text=f"📩 Материал от {user_tag(message)}:"
+                )
+                topic_link[caption_msg.message_id] = message.from_user.id
 
+                # отправляем сам альбом батчами
+                await send_album_in_chunks(ADMIN_CHAT_ID, TOPIC_MATERIAL, bucket)
 
-@router.message(F.chat.type == ChatType.PRIVATE)
-async def handle_user_message(message: Message) -> None:
-    if message.text:
-        stripped = message.text.strip()
-        if not stripped or stripped.startswith("/"):
+                # чистим память
+                albums.pop(key, None)
+
+                # подтверждение пользователю
+                await message.answer(TEXT_THANKS_MATERIAL, reply_markup=menu_kb)
+                user_mode[message.from_user.id] = None
             return
-        if stripped in {
-            config.BUTTONS.send_material,
-            config.BUTTONS.ask_question,
-            config.TEXTS.back_button,
-        }:
+
+        # одиночные медиа / документы
+        if message.photo or message.video or message.document:
+            header = await bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                message_thread_id=TOPIC_MATERIAL,
+                text=f"📩 Материал от {user_tag(message)}:"
+            )
+            topic_link[header.message_id] = message.from_user.id
+
+            if message.photo:
+                await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, message_thread_id=TOPIC_MATERIAL)
+            elif message.video:
+                await bot.send_video(ADMIN_CHAT_ID, message.video.file_id, message_thread_id=TOPIC_MATERIAL)
+            elif message.document:
+                await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, message_thread_id=TOPIC_MATERIAL)
+
+            await message.answer(TEXT_THANKS_MATERIAL, reply_markup=menu_kb)
+            user_mode[message.from_user.id] = None
             return
 
-    user_id = message.from_user.id if message.from_user else None
+        # текст не в тему — напомним инструкцию
+        await message.answer(TEXT_MATERIAL_INSTR, reply_markup=back_kb)
+        return
+
+    # вне режима — покажем меню
+    await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
+
+# --- Ответы админа в темах группы ---
+@dp.message(F.chat.id == ADMIN_CHAT_ID)
+async def relay_admin_reply(message: Message):
+    # работаем только если это реплай на сообщение бота в теме
+    if not message.reply_to_message:
+        return
+
+    # 1) пробуем найти user_id из нашей карты
+    user_id = topic_link.get(message.reply_to_message.message_id)
+
+    # 2) если нет — пробуем распарсить из текста "(id=12345)"
     if not user_id:
-        logger.warning("Received message without user information")
-        return
+        src = message.reply_to_message.text or message.reply_to_message.caption or ""
+        m = ID_RE.search(src)
+        if m:
+            try:
+                user_id = int(m.group(1))
+            except ValueError:
+                user_id = None
 
-    user_info = _format_user(message)
-    logger.info("Received message from %s", user_info)
-
-    if any((
-        message.photo,
-        message.video,
-        message.document,
-        message.animation,
-        message.audio,
-        message.voice,
-    )):
-        await _process_material_message(message, user_id, user_info)
-    elif message.text:
-        await _process_question_message(message, user_id, user_info)
-    else:
-        await message.answer(config.TEXTS.unsupported_content)
-
-
-async def _process_material_message(message: Message, user_id: int, user_info: str) -> None:
-    topic = config.TOPIC_MATERIAL
-    if topic == 0:
-        logger.error("Topic ID for materials is not configured")
-        await _notify_delivery_error(message)
-        return
-
-    try:
-        copied_message = await message.copy_to(
-            chat_id=config.ADMIN_CHAT_ID,
-            message_thread_id=topic,
-        )
-        message_links[copied_message.message_id] = user_id
-        summary = await message.bot.send_message(
-            chat_id=config.ADMIN_CHAT_ID,
-            message_thread_id=topic,
-            text=f"📸 Материал от {user_info}",
-        )
-        message_links[summary.message_id] = user_id
-    except TelegramAPIError as exc:
-        logger.exception("Failed to forward material from %s: %s", user_info, exc)
-        await _notify_delivery_error(message)
-        return
-
-    logger.info("Material from %s forwarded to topic %s", user_info, topic)
-    await message.answer(config.TEXTS.material_sent)
-
-
-async def _process_question_message(message: Message, user_id: int, user_info: str) -> None:
-    topic = config.TOPIC_QUESTION
-    if topic == 0:
-        logger.error("Topic ID for questions is not configured")
-        await _notify_delivery_error(message)
-        return
-
-    text = message.text or ""
-    try:
-        admin_message = await message.bot.send_message(
-            chat_id=config.ADMIN_CHAT_ID,
-            message_thread_id=topic,
-            text=f"❓ Вопрос от {user_info}:\n{text}",
-        )
-        message_links[admin_message.message_id] = user_id
-    except TelegramAPIError as exc:
-        logger.exception("Failed to forward question from %s: %s", user_info, exc)
-        await _notify_delivery_error(message)
-        return
-
-    logger.info("Question from %s forwarded to topic %s", user_info, topic)
-    await message.answer(config.TEXTS.question_sent)
-
-
-@router.message(F.chat.id == config.ADMIN_CHAT_ID)
-async def admin_reply(message: Message) -> None:
-    reply = message.reply_to_message
-    if not reply:
-        return
-
-    user_id = message_links.get(reply.message_id)
     if not user_id:
-        logger.debug("No user link for message %s", reply.message_id)
-        return
+        return  # не нашли адресата
 
     try:
-        await _send_admin_reply(message, user_id)
-    except TelegramAPIError as exc:
-        logger.exception("Failed to deliver admin reply to user %s: %s", user_id, exc)
-        await message.reply("⚠️ Не удалось отправить сообщение пользователю.")
-        return
+        if message.text:
+            await bot.send_message(user_id, f"💬 Ответ администратора:\n\n{message.text}")
+        elif message.photo:
+            await bot.send_photo(user_id, message.photo[-1].file_id, caption="💬 Ответ администратора")
+        elif message.video:
+            await bot.send_video(user_id, message.video.file_id, caption="💬 Ответ администратора")
+        elif message.document:
+            await bot.send_document(user_id, message.document.file_id, caption="💬 Ответ администратора")
+    except Exception as e:
+        log.error(f"Не удалось отправить ответ пользователю {user_id}: {e}")
 
-    logger.info("Delivered admin reply from thread message %s to user %s", reply.message_id, user_id)
-
-
-async def _send_admin_reply(message: Message, user_id: int) -> None:
-    bot = message.bot
-    prefix = config.TEXTS.admin_reply_prefix
-
-    if message.text:
-        await bot.send_message(user_id, f"{prefix}\n{message.text}")
-        return
-
-    caption = message.caption or ""
-    caption_text = f"{prefix}\n{caption}" if caption else prefix
-
-    if message.photo:
-        await bot.send_photo(user_id, message.photo[-1].file_id, caption=caption_text)
-    elif message.video:
-        await bot.send_video(user_id, message.video.file_id, caption=caption_text)
-    elif message.document:
-        await bot.send_document(user_id, message.document.file_id, caption=caption_text)
-    elif message.audio:
-        await bot.send_audio(user_id, message.audio.file_id, caption=caption_text)
-    elif message.voice:
-        await bot.send_voice(user_id, message.voice.file_id, caption=caption_text)
-    elif message.animation:
-        await bot.send_animation(user_id, message.animation.file_id, caption=caption_text)
-    else:
-        await bot.send_message(user_id, prefix)
-        await message.copy_to(user_id)
-
-
-async def main() -> None:
-    if not config.BOT_TOKEN or config.BOT_TOKEN == "ТВОЙ_ТОКЕН":
-        raise RuntimeError("BOT_TOKEN is not configured. Set the BOT_TOKEN environment variable.")
-
-    dp = Dispatcher()
-    dp.include_router(router)
-
-    bot = Bot(token=config.BOT_TOKEN, parse_mode="HTML")
-
-    logger.info("Bot starting")
+# ---------- ЗАПУСК ----------
+async def main():
+    log.info("[BOT] Запуск…")
+    # на всякий случай удалим вебхук и отбросим старые апдейты
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
-        logger.exception("Bot stopped due to an unexpected error")
-        raise
-    finally:
-        await bot.session.close()
-        logger.info("Bot shutdown complete")
-
+        pass
+    await dp.start_polling(bot, allowed_updates=None)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("[BOT] Остановлен.")
