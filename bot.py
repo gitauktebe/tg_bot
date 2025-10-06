@@ -13,23 +13,17 @@ from aiogram.types import (
 
 from config import (
     TOKEN, ADMIN_CHAT_ID, TOPIC_MATERIAL, TOPIC_QUESTION,
-    TEXT_WELCOME, TEXT_MATERIAL_INSTR, TEXT_QUESTION_INSTR,
-    TEXT_BACK_BTN, TEXT_MENU_TITLE, TEXT_THANKS_MATERIAL, TEXT_THANKS_QUESTION,
-    ALBUM_CHUNK
+    TEXT_BACK_BTN, TEXT_MENU_TITLE
 )
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+# --- НАСТРОЙКА ЛОГОВ ---
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ---------- BOT / DP ----------
 bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# ---------- КЛАВИАТУРЫ ----------
+# --- КЛАВИАТУРЫ ---
 menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📷 Отправить материал")],
@@ -42,119 +36,96 @@ back_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ---------- ПРОСТЕЙШЕЕ СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ ----------
-# user_mode[user_id] = "material" | "question" | None
-user_mode: dict[int, str | None] = defaultdict(lambda: None)
-
-# Копим элементы альбомов по ключу (user_id, media_group_id)
-albums: dict[tuple[int, str], List[InputMediaPhoto | InputMediaVideo]] = {}
-
-# Привязка msg_id в теме -> user_id, чтобы админ мог ответить реплаем
-topic_link: dict[int, int] = {}
-
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+# --- СОСТОЯНИЯ И СВЯЗКИ ---
+user_mode = defaultdict(lambda: None)              # user_id -> режим ("material"/"question")
+albums = {}                                        # (user_id, media_group_id) -> список файлов
+topic_link = {}                                    # message_id в топике -> user_id
 ID_RE = re.compile(r"\(id=(\d+)\)")
 
+# --- ВСПОМОГАТЕЛЬНОЕ ---
 def user_tag(m: Message) -> str:
     uname = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
     return f"{uname} (id={m.from_user.id})"
 
-async def send_album_in_chunks(chat_id: int, thread_id: int, media_list: List[InputMediaPhoto | InputMediaVideo]):
-    """Отправляем альбом пачками по 10, если медиа больше лимита."""
-    if not media_list:
-        return []
-    chunks = [media_list[i:i+ALBUM_CHUNK] for i in range(0, len(media_list), ALBUM_CHUNK)]
-    sent_msgs = []
-    for chunk in chunks:
-        sent = await bot.send_media_group(chat_id=chat_id, message_thread_id=thread_id, media=chunk)
-        sent_msgs.extend(sent)
-        await asyncio.sleep(0.2)  # лёгкая пауза, чтобы не задирать CPU и не ловить flood
-    return sent_msgs
-
-# ---------- ХЭНДЛЕРЫ ----------
+# --- СТАРТ ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_mode[message.from_user.id] = None
-    await message.answer(TEXT_WELCOME, reply_markup=menu_kb)
+    await message.answer("👋 Привет! Выбери, что хочешь сделать:", reply_markup=menu_kb)
 
+# --- КНОПКИ ---
 @dp.message(F.text == "📷 Отправить материал")
 async def choose_material(message: Message):
     user_mode[message.from_user.id] = "material"
-    await message.answer(TEXT_MATERIAL_INSTR, reply_markup=back_kb)
+    await message.answer("📸 Прикрепи фото или видео материал, можешь добавить описание.", reply_markup=back_kb)
 
 @dp.message(F.text == "❓ Задать вопрос")
 async def choose_question(message: Message):
     user_mode[message.from_user.id] = "question"
-    await message.answer(TEXT_QUESTION_INSTR, reply_markup=back_kb)
+    await message.answer("💬 Напиши любой вопрос по урокам физкультуры и спорту в школе. И тебе ответят здесь в ближайшее время.", reply_markup=back_kb)
 
 @dp.message(F.text == TEXT_BACK_BTN)
 async def back_to_menu(message: Message):
     user_mode[message.from_user.id] = None
     await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
 
-# --- Основной обработчик лички пользователя ---
+# --- ОБРАБОТКА СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЯ ---
 @dp.message(F.chat.type == "private")
-async def handle_user_private(message: Message):
+async def handle_user_message(message: Message):
     mode = user_mode.get(message.from_user.id)
+    uid = message.from_user.id
+    tag = user_tag(message)
 
-    # 1) Режим ВОПРОС
+    # ---- ВОПРОС ----
     if mode == "question":
-        if message.text:
-            header = f"❓ Вопрос от {user_tag(message)}:\n\n{message.text}"
-        else:
-            header = f"❓ Вопрос от {user_tag(message)}"
-        sent = await bot.send_message(
+        msg = await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             message_thread_id=TOPIC_QUESTION,
-            text=header
+            text=f"❓ Вопрос от {tag}:\n{message.text or ''}"
         )
-        topic_link[sent.message_id] = message.from_user.id
-        await message.answer(TEXT_THANKS_QUESTION, reply_markup=menu_kb)
-        user_mode[message.from_user.id] = None
+        topic_link[msg.message_id] = uid
+        await message.answer("✅ Вопрос отправлен! Ожидай ответ.", reply_markup=menu_kb)
+        user_mode[uid] = None
         return
 
-    # 2) Режим МАТЕРИАЛ
+    # ---- МАТЕРИАЛ ----
     if mode == "material":
-        # --- альбомы ---
+        # --- если альбом ---
         if message.media_group_id and (message.photo or message.video):
-            key = (message.from_user.id, message.media_group_id)
+            key = (uid, message.media_group_id)
             bucket = albums.setdefault(key, [])
             if message.photo:
                 bucket.append(InputMediaPhoto(media=message.photo[-1].file_id))
             elif message.video:
                 bucket.append(InputMediaVideo(media=message.video.file_id))
 
-            # «дебаунс» — ждём ещё немного элементов этого же альбома
-            await asyncio.sleep(1.2)
+            # ждём завершения альбома
+            await asyncio.sleep(1.5)
             if key in albums and bucket is albums[key]:
-                # отправляем заголовок один раз
+                # отправляем весь материал СНАЧАЛА
+                sent_media = await bot.send_media_group(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_thread_id=TOPIC_MATERIAL,
+                    media=bucket
+                )
+
+                # после отправки добавляем подпись
                 caption_msg = await bot.send_message(
                     chat_id=ADMIN_CHAT_ID,
                     message_thread_id=TOPIC_MATERIAL,
-                    text=f"📩 Материал от {user_tag(message)}:"
+                    text=f"📩 Материал от {tag}"
                 )
-                topic_link[caption_msg.message_id] = message.from_user.id
+                topic_link[caption_msg.message_id] = uid
 
-                # отправляем сам альбом батчами
-                await send_album_in_chunks(ADMIN_CHAT_ID, TOPIC_MATERIAL, bucket)
-
-                # чистим память
+                # подтверждаем пользователю
+                await message.answer("✅ Материал доставлен!", reply_markup=menu_kb)
+                user_mode[uid] = None
                 albums.pop(key, None)
-
-                # подтверждение пользователю
-                await message.answer(TEXT_THANKS_MATERIAL, reply_markup=menu_kb)
-                user_mode[message.from_user.id] = None
             return
 
-        # одиночные медиа / документы
+        # --- одиночное медиа ---
         if message.photo or message.video or message.document:
-            header = await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                message_thread_id=TOPIC_MATERIAL,
-                text=f"📩 Материал от {user_tag(message)}:"
-            )
-            topic_link[header.message_id] = message.from_user.id
-
+            # сначала отправляем файл
             if message.photo:
                 await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, message_thread_id=TOPIC_MATERIAL)
             elif message.video:
@@ -162,40 +133,49 @@ async def handle_user_private(message: Message):
             elif message.document:
                 await bot.send_document(ADMIN_CHAT_ID, message.document.file_id, message_thread_id=TOPIC_MATERIAL)
 
-            await message.answer(TEXT_THANKS_MATERIAL, reply_markup=menu_kb)
-            user_mode[message.from_user.id] = None
+            # затем подпись
+            sent = await bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                message_thread_id=TOPIC_MATERIAL,
+                text=f"📩 Материал от {tag}"
+            )
+            topic_link[sent.message_id] = uid
+
+            await message.answer("✅ Материал доставлен!", reply_markup=menu_kb)
+            user_mode[uid] = None
             return
 
-        # текст не в тему — напомним инструкцию
-        await message.answer(TEXT_MATERIAL_INSTR, reply_markup=back_kb)
+        # --- если текст без вложений ---
+        await message.answer("📸 Прикрепи фото или видео материал, можешь добавить описание.", reply_markup=back_kb)
         return
 
-    # вне режима — покажем меню
+    # если вне режима
     await message.answer(TEXT_MENU_TITLE, reply_markup=menu_kb)
 
-# --- Ответы админа в темах группы ---
+# --- ОТВЕТ АДМИНА ---
 @dp.message(F.chat.id == ADMIN_CHAT_ID)
-async def relay_admin_reply(message: Message):
-    # работаем только если это реплай на сообщение бота в теме
+async def handle_admin_reply(message: Message):
+    """Любой reply из топика пересылает пользователю ответ."""
     if not message.reply_to_message:
         return
 
-    # 1) пробуем найти user_id из нашей карты
+    # пробуем найти user_id из topic_link
     user_id = topic_link.get(message.reply_to_message.message_id)
 
-    # 2) если нет — пробуем распарсить из текста "(id=12345)"
+    # если не нашли — парсим (id=12345)
     if not user_id:
         src = message.reply_to_message.text or message.reply_to_message.caption or ""
-        m = ID_RE.search(src)
-        if m:
+        match = ID_RE.search(src)
+        if match:
             try:
-                user_id = int(m.group(1))
+                user_id = int(match.group(1))
             except ValueError:
                 user_id = None
 
     if not user_id:
-        return  # не нашли адресата
+        return
 
+    # отправляем ответ
     try:
         if message.text:
             await bot.send_message(user_id, f"💬 Ответ администратора:\n\n{message.text}")
@@ -206,20 +186,13 @@ async def relay_admin_reply(message: Message):
         elif message.document:
             await bot.send_document(user_id, message.document.file_id, caption="💬 Ответ администратора")
     except Exception as e:
-        log.error(f"Не удалось отправить ответ пользователю {user_id}: {e}")
+        log.error(f"Ошибка при пересылке ответа: {e}")
 
-# ---------- ЗАПУСК ----------
+# --- ЗАПУСК ---
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
     log.info("[BOT] Запуск…")
-    # на всякий случай удалим вебхук и отбросим старые апдейты
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
     await dp.start_polling(bot, allowed_updates=None)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("[BOT] Остановлен.")
+    asyncio.run(main())
