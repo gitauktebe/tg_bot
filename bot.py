@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
+from aiogram import F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
@@ -62,7 +63,8 @@ async def go_back(message: Message):
     await message.answer("Главное меню:", reply_markup=main_menu)
 
 # Получение медиа/текста от пользователя
-@dp.message()
+# Обрабатываем только личные сообщения пользователей, чтобы не реагировать на ответы админов в чате
+@dp.message(F.chat.type == "private")
 async def handle_user_message(message: Message):
     user_info = f"{message.from_user.full_name} (@{message.from_user.username or 'без_username'}) (id={message.from_user.id})"
 
